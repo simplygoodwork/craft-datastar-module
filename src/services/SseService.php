@@ -8,14 +8,14 @@ namespace putyourlightson\datastar\services;
 use Craft;
 use craft\base\Component;
 use putyourlightson\datastar\Datastar;
-use putyourlightson\datastar\models\SignalsModel;
+use putyourlightson\datastar\helpers\RequestHelper;
 use putyourlightson\datastar\web\StreamedResponse;
 use starfederation\datastar\events\EventInterface;
 use starfederation\datastar\events\ExecuteScript;
-use starfederation\datastar\events\MergeFragments;
-use starfederation\datastar\events\MergeSignals;
-use starfederation\datastar\events\RemoveFragments;
-use starfederation\datastar\events\RemoveSignals;
+use starfederation\datastar\events\Location;
+use starfederation\datastar\events\PatchElements;
+use starfederation\datastar\events\PatchSignals;
+use starfederation\datastar\events\RemoveElements;
 use starfederation\datastar\ServerSentEventGenerator;
 use Throwable;
 use yii\web\BadRequestHttpException;
@@ -32,6 +32,11 @@ class SseService extends Component
      * Whether to send SSE events when processing them.
      */
     private bool $sendSseEvents = true;
+
+    /**
+     * Server sent event options to send.
+     */
+    private array $sseEventOptions = [];
 
     /**
      * The server sent event method currently in process.
@@ -77,61 +82,46 @@ class SseService extends Component
     }
 
     /**
-     * Returns a signals model populated with signals passed into the request.
+     * Patches elements into the DOM.
      */
-    public function getSignals(): SignalsModel
+    public function patchElements(string $data, array $options = [], bool $send = true): void
     {
-        return new SignalsModel(ServerSentEventGenerator::readSignals());
-    }
-
-    /**
-     * Merges HTML fragments into the DOM.
-     */
-    public function mergeFragments(string $data, array $options = [], bool $send = true): void
-    {
-        $options = $this->mergeEventOptions(
-            Datastar::getInstance()->settings->defaultFragmentOptions,
+        $options = $this->patchEventOptions(
+            Datastar::getInstance()->settings->defaultElementOptions,
+            $this->sseEventOptions,
             $options,
         );
-        $event = new MergeFragments($data, $options);
+        $event = new PatchElements($data, $options);
 
         $this->processEvent($event, $send);
     }
 
     /**
-     * Removes HTML fragments from the DOM.
+     * Removes elements from the DOM.
      */
-    public function removeFragments(string $selector, array $options = [], bool $send = true): void
+    public function removeElements(string $selector, array $options = [], bool $send = true): void
     {
-        $options = $this->mergeEventOptions(
-            Datastar::getInstance()->settings->defaultFragmentOptions,
+        $options = $this->patchEventOptions(
+            Datastar::getInstance()->settings->defaultElementOptions,
+            $this->sseEventOptions,
             $options,
         );
-        $event = new RemoveFragments($selector, $options);
+        $event = new RemoveElements($selector, $options);
 
         $this->processEvent($event, $send);
     }
 
     /**
-     * Merges signals.
+     * Patches signals.
      */
-    public function mergeSignals(array $signals, array $options = [], bool $send = true): void
+    public function patchSignals(array $signals, array $options = [], bool $send = true): void
     {
-        $options = $this->mergeEventOptions(
+        $options = $this->patchEventOptions(
             Datastar::getInstance()->settings->defaultSignalOptions,
+            $this->sseEventOptions,
             $options,
         );
-        $event = new MergeSignals($signals, $options);
-
-        $this->processEvent($event, $send);
-    }
-
-    /**
-     * Removes signal paths.
-     */
-    public function removeSignals(array $paths, array $options = [], bool $send = true): void
-    {
-        $event = new RemoveSignals($paths, $options);
+        $event = new PatchSignals($signals, $options);
 
         $this->processEvent($event, $send);
     }
@@ -141,8 +131,9 @@ class SseService extends Component
      */
     public function executeScript(string $script, array $options = [], bool $send = true): void
     {
-        $options = $this->mergeEventOptions(
+        $options = $this->patchEventOptions(
             Datastar::getInstance()->settings->defaultExecuteScriptOptions,
+            $this->sseEventOptions,
             $options,
         );
 
@@ -156,42 +147,15 @@ class SseService extends Component
      */
     public function location(string $uri, array $options = [], bool $send = true): void
     {
-        $options = $this->mergeEventOptions(
+        $options = $this->patchEventOptions(
             Datastar::getInstance()->settings->defaultExecuteScriptOptions,
+            $this->sseEventOptions,
             $options,
         );
 
-        $script = "setTimeout(() => window.location = '$uri')";
-        $event = new ExecuteScript($script, $options);
+        $event = new Location($uri, $options);
 
         $this->processEvent($event, $send);
-    }
-
-    /**
-     * Runs an action and returns the response.
-     */
-    public function runAction(string $route, array $params = []): Response
-    {
-        $request = Craft::$app->getRequest();
-        $request->getHeaders()->set('Accept', 'application/json');
-
-        if ($request->getIsGet()) {
-            $requestParams = $request->getQueryParams();
-            $request->setQueryParams(array_merge($requestParams, $params));
-        } else {
-            $requestParams = $request->getBodyParams();
-            $request->setBodyParams(array_merge($requestParams, $params));
-        }
-
-        $response = Craft::$app->runAction($route);
-
-        if ($request->getIsGet()) {
-            $request->setQueryParams($requestParams);
-        } else {
-            $request->setBodyParams($requestParams);
-        }
-
-        return $response;
     }
 
     /**
@@ -203,7 +167,7 @@ class SseService extends Component
             $this->throwException('Template `' . $template . '` does not exist.');
         }
 
-        $signals = $this->getSignals();
+        $signals = RequestHelper::readSignals();
         $variables = array_merge(
             [Datastar::getInstance()->settings->signalsVariableName => $signals],
             $variables,
@@ -221,18 +185,30 @@ class SseService extends Component
         }
 
         try {
-            Craft::$app->getView()->renderTemplate($template, $variables);
+            $output = Craft::$app->getView()->renderTemplate($template, $variables);
         } catch (Throwable $exception) {
             $this->throwException($exception);
+        }
+
+        if (trim($output) !== '') {
+            $this->patchElements($output, [], $sendSseEvents);
         }
 
         $this->sendSseEvents = $originalSendSseEvents;
     }
 
     /**
+     * Sets server sent event options.
+     */
+    public function setSseEventOptions(array $options): void
+    {
+        $this->sseEventOptions = $options;
+    }
+
+    /**
      * Sets the server sent event method currently in process.
      */
-    public function setSseInProcess(?string $method): void
+    public function setSseMethodInProcess(?string $method): void
     {
         $this->sseMethodInProcess = $method;
     }
@@ -255,9 +231,9 @@ class SseService extends Component
     }
 
     /**
-     * Returns merged event options with null values removed.
+     * Returns patch event options with null values removed.
      */
-    private function mergeEventOptions(array ...$optionSets): array
+    private function patchEventOptions(array ...$optionSets): array
     {
         $options = Datastar::getInstance()->settings->defaultEventOptions;
 
@@ -298,14 +274,14 @@ class SseService extends Component
         }
 
         // Append the resulting output to the response data.
-        $this->responseData .= $event->getOutput();
+        $this->responseData .= $output;
 
         if ($shouldSend) {
             // Start a new output buffer to capture any subsequent inline content.
             ob_start();
         }
 
-        $this->setSseInProcess(null);
+        $this->setSseMethodInProcess(null);
     }
 
     /**
@@ -318,10 +294,9 @@ class SseService extends Component
         }
 
         $sseMethods = [
-            MergeFragments::class => 'mergeFragments',
-            RemoveFragments::class => 'removeFragments',
-            MergeSignals::class => 'mergeSignals',
-            RemoveSignals::class => 'removeSignals',
+            PatchElements::class => 'patchElements',
+            RemoveElements::class => 'removeElements',
+            PatchSignals::class => 'patchSignals',
             ExecuteScript::class => 'executeScript',
         ];
 
@@ -332,8 +307,8 @@ class SseService extends Component
 
         if ($method !== $this->sseMethodInProcess) {
             $message = 'The SSE method `' . $method . '` cannot be called when `' . $this->sseMethodInProcess . '` is already in process.';
-            if (in_array($method, ['mergeSignals', 'removeSignals'])) {
-                $message .= ' Ensure that you are not setting or removing signals inside `{% fragment %}` or `{% executescript %}` tags.';
+            if ($method === 'patchElements') {
+                $message .= ' Ensure that you are not setting or removing signals inside `{% patchelements %}` or `{% executescript %}` tags.';
             }
             $this->throwException($message);
         }

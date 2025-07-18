@@ -8,24 +8,23 @@ namespace putyourlightson\datastar\twigextensions\nodes;
 use putyourlightson\datastar\Datastar;
 use putyourlightson\datastar\services\SseService;
 use Twig\Compiler;
+use Twig\Node\Node;
 
-trait CompileWithOptionsTrait
+class PatchSignalsNode extends Node
 {
     /**
-     * Compiles a node with options.
-     *
-     * @uses SseService::setSseMethodInProcess()
+     * @uses SseService::patchSignals()
      */
-    public function compileWithOptions(Compiler $compiler, string $method): void
+    public function compile(Compiler $compiler): void
     {
+        $signals = $this->getNode('signals');
         $options = $this->hasNode('options') ? $this->getNode('options') : null;
 
         $compiler
             ->addDebugInfo($this)
-            ->write(Datastar::class . "::getInstance()->sse->setSseMethodInProcess('$method');\n")
-            ->write("ob_start();\n")
-            ->subcompile($this->getNode('body'))
-            ->write("\$content = ob_get_clean();\n")
+            ->write("\$signals = ")
+            ->subcompile($signals)
+            ->raw(";\n")
             ->write("\$options = ");
 
         if ($options) {
@@ -36,6 +35,6 @@ trait CompileWithOptionsTrait
 
         $compiler
             ->raw(";\n")
-            ->write(Datastar::class . "::getInstance()->sse->$method(\$content, \$options);\n");
+            ->write(Datastar::class . "::getInstance()->sse->patchSignals(\$signals, \$options);\n");
     }
 }
