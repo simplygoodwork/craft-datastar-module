@@ -6,7 +6,6 @@
 
 use putyourlightson\datastar\Datastar;
 use putyourlightson\datastar\services\SseService;
-use yii\web\BadRequestHttpException;
 
 beforeEach(function() {
     Datastar::getInstance()->set('sse', SseService::class);
@@ -14,9 +13,9 @@ beforeEach(function() {
 });
 
 test('Test that elements output in templates are patched', function(string $template) {
-    Datastar::getInstance()->sse->renderDatastarTemplate($template, [], false);
+    Datastar::getInstance()->sse->renderTemplate($template);
 
-    expect(Datastar::getInstance()->sse->getResponseData())
+    expect(Datastar::getInstance()->sse->getEventOutput())
         ->toContain('data: elements <div>test</div>');
 })->with([
     'html',
@@ -25,13 +24,8 @@ test('Test that elements output in templates are patched', function(string $temp
 ]);
 
 test('Test remove elements tag', function() {
-    Datastar::getInstance()->sse->renderDatastarTemplate('remove', [], false);
+    Datastar::getInstance()->sse->renderTemplate('remove');
 
-    expect(Datastar::getInstance()->sse->getResponseData())
+    expect(Datastar::getInstance()->sse->getEventOutput())
         ->toContain('data: mode remove');
 });
-
-test('Test that calling an SSE method when another one is in process throws an exception', function() {
-    Datastar::getInstance()->sse->setSseMethodInProcess('patchElements');
-    Datastar::getInstance()->sse->patchSignals([]);
-})->throws(BadRequestHttpException::class);
