@@ -7,9 +7,13 @@ namespace putyourlightson\datastar\services;
 
 use Craft;
 use craft\base\Component;
+use craft\web\ErrorHandler;
+use craft\web\Response;
+use DateTimeInterface;
+use Exception;
 use putyourlightson\datastar\Datastar;
-use putyourlightson\datastar\helpers\RequestHelper;
-use putyourlightson\datastar\web\StreamedResponse;
+use putyourlightson\datastar\helpers\Request;
+use starfederation\datastar\enums\ElementPatchMode;
 use starfederation\datastar\events\EventInterface;
 use starfederation\datastar\events\ExecuteScript;
 use starfederation\datastar\events\Location;
@@ -18,20 +22,27 @@ use starfederation\datastar\events\PatchSignals;
 use starfederation\datastar\events\RemoveElements;
 use starfederation\datastar\ServerSentEventGenerator;
 use Throwable;
-use yii\web\BadRequestHttpException;
-use yii\web\Response;
+use yii\web\Cookie;
 
 class SseService extends Component
 {
     /**
-     * The response data.
+     * Whether the response is a streamed response.
      */
-    private string $responseData = '';
+    private bool $isStreamedResponse = false;
 
     /**
-     * Whether to send SSE events when processing them.
+     * Whether the session should be closed when the event stream begins.
+     * This is useful to allow other requests to be processed while the event stream is being sent.
      */
-    private bool $sendSseEvents = true;
+    private bool $shouldCloseSession = true;
+
+    /**
+     * Server sent events to send.
+     *
+     * @var EventInterface[]
+     */
+    private array $sseEvents = [];
 
     /**
      * Server sent event options to send.
@@ -44,15 +55,30 @@ class SseService extends Component
     private ?string $sseMethodInProcess = null;
 
     /**
-     * Returns a streamed response.
+     * Returns an event stream.
      */
-    public function getStreamedResponse(?callable $callable = null): StreamedResponse
+    public function getEventStream(?callable $callable = null): Response
     {
-        $response = Datastar::getInstance()->streamedResponse;
-        Craft::$app->set('response', $response);
+        // Abort the process if the client closes the connection.
+        ignore_user_abort(false);
+
+        $this->isStreamedResponse = true;
+
+        /** @var Response $response */
+        $response = Craft::$app->getResponse();
 
         $response->stream = function() use ($callable) {
-            if ($callable !== null) {
+            if ($this->shouldCloseSession && session_status() === PHP_SESSION_ACTIVE) {
+                session_write_close();
+            }
+
+            echo $this->getEventOutput();
+            if (ob_get_contents()) {
+                ob_flush();
+            }
+            flush();
+
+            if (is_callable($callable)) {
                 $callable();
             }
 
@@ -74,17 +100,34 @@ class SseService extends Component
     }
 
     /**
-     * Returns the response data.
+     * Returns the output of all events as a string.
      */
-    public function getResponseData(): string
+    public function getEventOutput(bool $reset = true): string
     {
-        return $this->responseData;
+        $data = '';
+        foreach ($this->sseEvents as $event) {
+            $data .= $event->getOutput();
+        }
+
+        if ($reset) {
+            $this->resetEvents();
+        }
+
+        return $data;
+    }
+
+    /**
+     * Reads and returns the signals passed into the request.
+     */
+    public function readSignals(): array
+    {
+        return Request::readSignals();
     }
 
     /**
      * Patches elements into the DOM.
      */
-    public function patchElements(string $data, array $options = [], bool $send = true): void
+    public function patchElements(string $data, array $options = []): static
     {
         $options = $this->patchEventOptions(
             Datastar::getInstance()->settings->defaultElementOptions,
@@ -93,13 +136,15 @@ class SseService extends Component
         );
         $event = new PatchElements($data, $options);
 
-        $this->processEvent($event, $send);
+        $this->processEvent($event);
+
+        return $this;
     }
 
     /**
      * Removes elements from the DOM.
      */
-    public function removeElements(string $selector, array $options = [], bool $send = true): void
+    public function removeElements(string $selector, array $options = []): static
     {
         $options = $this->patchEventOptions(
             Datastar::getInstance()->settings->defaultElementOptions,
@@ -108,13 +153,15 @@ class SseService extends Component
         );
         $event = new RemoveElements($selector, $options);
 
-        $this->processEvent($event, $send);
+        $this->processEvent($event);
+
+        return $this;
     }
 
     /**
      * Patches signals.
      */
-    public function patchSignals(array $signals, array $options = [], bool $send = true): void
+    public function patchSignals(array $signals, array $options = []): static
     {
         $options = $this->patchEventOptions(
             Datastar::getInstance()->settings->defaultSignalOptions,
@@ -123,13 +170,15 @@ class SseService extends Component
         );
         $event = new PatchSignals($signals, $options);
 
-        $this->processEvent($event, $send);
+        $this->processEvent($event);
+
+        return $this;
     }
 
     /**
      * Executes JavaScript in the browser.
      */
-    public function executeScript(string $script, array $options = [], bool $send = true): void
+    public function executeScript(string $script, array $options = []): static
     {
         $options = $this->patchEventOptions(
             Datastar::getInstance()->settings->defaultExecuteScriptOptions,
@@ -139,13 +188,15 @@ class SseService extends Component
 
         $event = new ExecuteScript($script, $options);
 
-        $this->processEvent($event, $send);
+        $this->processEvent($event);
+
+        return $this;
     }
 
     /**
      * Redirects the browser by setting the location to the provided URI.
      */
-    public function location(string $uri, array $options = [], bool $send = true): void
+    public function location(string $uri, array $options = []): static
     {
         $options = $this->patchEventOptions(
             Datastar::getInstance()->settings->defaultExecuteScriptOptions,
@@ -155,26 +206,21 @@ class SseService extends Component
 
         $event = new Location($uri, $options);
 
-        $this->processEvent($event, $send);
+        $this->processEvent($event);
+
+        return $this;
     }
 
     /**
-     * Renders a Datastar template.
+     * Renders a template.
      */
-    public function renderDatastarTemplate(string $template, array $variables = [], bool $sendSseEvents = true): void
+    public function renderTemplate(string $template, array $variables = []): static
     {
-        if (!Craft::$app->getView()->doesTemplateExist($template)) {
-            $this->throwException('Template `' . $template . '` does not exist.');
-        }
-
-        $signals = RequestHelper::readSignals();
+        $signals = $this->readSignals();
         $variables = array_merge(
             [Datastar::getInstance()->settings->signalsVariableName => $signals],
             $variables,
         );
-
-        $originalSendSseEvents = $this->sendSseEvents;
-        $this->sendSseEvents = $sendSseEvents;
 
         $request = Craft::$app->getRequest();
 
@@ -186,48 +232,96 @@ class SseService extends Component
 
         try {
             $output = Craft::$app->getView()->renderTemplate($template, $variables);
+            if (!empty(trim($output))) {
+                $this->patchElements($output);
+            }
         } catch (Throwable $exception) {
             $this->throwException($exception);
         }
 
-        if (trim($output) !== '') {
-            $this->patchElements($output, [], $sendSseEvents);
-        }
-
-        $this->sendSseEvents = $originalSendSseEvents;
+        return $this;
     }
 
     /**
-     * Sets server sent event options.
+     * Resets the events.
      */
-    public function setSseEventOptions(array $options): void
+    public function resetEvents(): static
+    {
+        $this->sseEvents = [];
+
+        return $this;
+    }
+
+    /**
+     * Sets server sent event options for the current request.
+     */
+    public function setSseEventOptions(array $options): static
     {
         $this->sseEventOptions = $options;
+
+        return $this;
     }
 
     /**
      * Sets the server sent event method currently in process.
      */
-    public function setSseMethodInProcess(?string $method): void
+    public function setSseMethodInProcess(?string $method): static
     {
         $this->sseMethodInProcess = $method;
+
+        return $this;
     }
 
     /**
-     * Throws an exception with the appropriate formats for easier debugging.
+     * Determines whether the session should be closed when the event stream begins.
+     */
+    public function shouldCloseSession(bool $value): static
+    {
+        $this->shouldCloseSession = $value;
+
+        return $this;
+    }
+
+    /**
+     * Throws an exception or logs a console error, for easier debugging.
      *
      * @phpstan-return never
      */
-    public function throwException(Throwable|string $exception): void
+    public function throwException(Throwable $exception): void
     {
-        Craft::$app->getRequest()->getHeaders()->set('Accept', 'text/html');
-        Craft::$app->getResponse()->format = Response::FORMAT_HTML;
+        $this->getEventStream(function() use ($exception) {
+            /** @var ErrorHandler $errorHandler */
+            $errorHandler = Craft::$app->getErrorHandler();
+            $errorHandler->logException($exception);
 
-        if ($exception instanceof Throwable) {
-            throw $exception;
+            if ($errorHandler->showExceptionDetails()) {
+                $event = new PatchElements($errorHandler->renderFile($errorHandler->exceptionView, [
+                    'exception' => $exception,
+                ]));
+            } else {
+                $message = Craft::t('app', 'A server error occurred.');
+                $event = new ExecuteScript('console.error(' . json_encode($message) . ');');
+            }
+
+            echo $event->getOutput();
+        })->send();
+
+        exit(1);
+    }
+
+    /**
+     * Prepends dumped content to the `<body>` tag.
+     */
+    public function dump(string $output): void
+    {
+        $this->patchElements($output, [
+            'selector' => 'body',
+            'mode' => ElementPatchMode::Prepend,
+        ]);
+
+        if (!$this->isStreamedResponse) {
+            $this->getEventStream()->send();
         }
-
-        throw new BadRequestHttpException($exception);
     }
 
     /**
@@ -247,41 +341,92 @@ class SseService extends Component
     /**
      * Processes an event.
      */
-    private function processEvent(EventInterface $event, bool $send): void
+    private function processEvent(EventInterface $event): void
     {
         $this->verifySseMethodInProcess($event);
 
-        Datastar::getInstance()->streamedResponse->resendHeaders();
+        $this->sseEvents[] = $event;
 
-        $shouldSend = $this->sendSseEvents && $send;
+        if ($this->isStreamedResponse) {
+            $this->resendHeadersAndCookies();
 
-        if ($shouldSend) {
             // Clean and end all existing output buffers.
             while (ob_get_level() > 0) {
                 ob_end_clean();
             }
-        }
 
-        $output = $event->getOutput();
-
-        if ($shouldSend) {
-            echo $output;
+            echo $event->getOutput();
 
             if (ob_get_contents()) {
                 ob_end_flush();
             }
             flush();
-        }
 
-        // Append the resulting output to the response data.
-        $this->responseData .= $output;
-
-        if ($shouldSend) {
             // Start a new output buffer to capture any subsequent inline content.
             ob_start();
         }
 
         $this->setSseMethodInProcess(null);
+    }
+
+    /**
+     * Resends response headers and cookies that may have been set in processed events.
+     *
+     * @see Response::sendHeaders()
+     * @see Response::sendCookies()
+     */
+    private function resendHeadersAndCookies(): void
+    {
+        if (headers_sent()) {
+            return;
+        }
+
+        foreach (Craft::$app->getResponse()->getHeaders() as $name => $values) {
+            $name = str_replace(' ', '-', ucwords(str_replace('-', ' ', $name)));
+            $replace = true;
+            foreach ($values as $value) {
+                header("$name: $value", $replace);
+                $replace = false;
+            }
+        }
+
+        $validationKey = Craft::$app->getRequest()->cookieValidationKey;
+        foreach (Craft::$app->getResponse()->getCookies() as $cookie) {
+            $value = $cookie->value;
+            $expire = $cookie->expire;
+            if (is_string($expire)) {
+                $expire = strtotime($expire);
+            } elseif ($expire instanceof DateTimeInterface) {
+                $expire = $expire->getTimestamp();
+            }
+            if ($expire === null || $expire === false) {
+                $expire = 0;
+            }
+            if ($expire != 1) {
+                $value = Craft::$app->getSecurity()->hashData(serialize([$cookie->name, $value]), $validationKey);
+            }
+
+            setcookie($cookie->name, $value, [
+                'expires' => $expire,
+                'path' => $cookie->path,
+                'domain' => $cookie->domain,
+                'secure' => $cookie->secure,
+                'httpOnly' => $cookie->httpOnly,
+                'sameSite' => !empty($cookie->sameSite) ? $cookie->sameSite : null,
+            ]);
+        }
+
+        foreach (Craft::$app->getResponse()->getRawCookies() as $cookie) {
+            /** @var Cookie $cookie */
+            setcookie($cookie->name, $cookie->value, [
+                'expires' => $cookie->expire,
+                'path' => $cookie->path,
+                'domain' => $cookie->domain,
+                'secure' => $cookie->secure,
+                'httpOnly' => $cookie->httpOnly,
+                'sameSite' => !empty($cookie->sameSite) ? $cookie->sameSite : null,
+            ]);
+        }
     }
 
     /**
@@ -310,7 +455,7 @@ class SseService extends Component
             if ($method === 'patchElements') {
                 $message .= ' Ensure that you are not setting or removing signals inside `{% patchelements %}` or `{% executescript %}` tags.';
             }
-            $this->throwException($message);
+            $this->throwException(new Exception($message));
         }
     }
 }

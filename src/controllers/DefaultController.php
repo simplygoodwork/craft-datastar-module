@@ -7,14 +7,15 @@ namespace putyourlightson\datastar\controllers;
 
 use Craft;
 use craft\web\Controller;
-use putyourlightson\datastar\DatastarEventStream;
-use putyourlightson\datastar\models\ConfigModel;
+use putyourlightson\datastar\models\Config;
+use putyourlightson\datastar\traits\Sse;
+use yii\web\BadRequestHttpException;
 use yii\web\ForbiddenHttpException;
 use yii\web\Response;
 
 class DefaultController extends Controller
 {
-    use DatastarEventStream;
+    use Sse;
 
     /**
      * @inheritdoc
@@ -36,18 +37,27 @@ class DefaultController extends Controller
     /**
      * Default controller action.
      */
-    public function actionIndex(): Response
+    public function actionIndex(): ?Response
     {
-        return $this->getStreamedResponse(function() {
-            $hashedConfig = $this->request->getParam('config');
-            $config = ConfigModel::fromHashed($hashedConfig);
-            if ($config === null) {
-                $this->throwException('Submitted data was tampered.');
-            }
+        $hashedConfig = $this->request->getParam('config');
+        $config = Config::fromHashed($hashedConfig);
+        if ($config === null) {
+            throw new BadRequestHttpException('Submitted data was tampered.');
+        }
+        Craft::$app->getSites()->setCurrentSite($config->siteId);
 
-            Craft::$app->getSites()->setCurrentSite($config->siteId);
+        $route = $config->route;
+        $params = $config->params;
+        $actionPrefix = Craft::$app->getConfig()->getGeneral()->actionTrigger . '/';
 
-            $this->renderDatastarTemplate($config->template, $config->variables);
+        if (str_starts_with($route, $actionPrefix)) {
+            $route = substr($route, strlen($actionPrefix));
+
+            return Craft::$app->runAction($route, $params);
+        }
+
+        return $this->sse()->getEventStream(function() use ($route, $params) {
+            $this->sse()->renderTemplate($route, $params);
         });
     }
 }
